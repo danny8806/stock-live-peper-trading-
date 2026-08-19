@@ -1,0 +1,58 @@
+{
+  "dhan": {
+    "client_id": "YOUR_CLIENT_ID",
+    "access_token": "YOUR_ACCESS_TOKEN",
+    "exchange_segment": "NSE_EQ",
+    "instrument_type": "EQUITY"
+  },
+  "stocks": {
+    "KAYNES": { "capital": 100000, "lot_size": 1, "enabled": true },
+    "RELIANCE": { "capital": 100000, "lot_size": 1, "enabled": true },
+    "TCS": { "capital": 100000, "lot_size": 1, "enabled": true },
+    "HFCL": { "capital": 100000, "lot_size": 1, "enabled": true },
+    "ADANIENT": { "capital": 100000, "lot_size": 1, "enabled": true }
+  },
+  "strategies": [
+    {
+      "name": "dema_15m_1h",
+      "fast": "15m",
+      "slow": "1h",
+      "dema_period": 3,
+      "atr_period": 6,
+      "atr_factor": 1.0,
+      "min_bars": 11,
+      "sl_pct": 0.0,
+      "tp_pct": 0.0,
+      "capital": 2000000,
+      "max_positions": 20,
+      "max_capital_per_stock": 100000,
+      "slippage_pct": 0.0005
+    },
+    {
+      "name": "dema_5m_15m",
+      "fast": "5m",
+      "slow": "15m",
+      "dema_period": 3,
+      "atr_period": 6,
+      "atr_factor": 1.0,
+      "min_bars": 11,
+      "sl_pct": 0.0,
+      "tp_pct": 0.0,
+      "capital": 1000000,
+      "max_positions": 10,
+      "max_capital_per_stock": 100000,
+      "slippage_pct": 0.0005
+    }
+  ],
+  "paper": {
+    "fetch_mode": "minute",
+    "cycle_seconds": 1.0,
+    "max_intraday_per_cycle": 20,
+    "poll_seconds_per_stock": 1.0
+  },
+  "app": {
+    "db_path": "live/live_trading.db",
+    "history_days": 5,
+    "monitor_port": 8000
+  }
+}

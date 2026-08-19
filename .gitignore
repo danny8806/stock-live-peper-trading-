@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Dhan / broker secrets — NEVER commit tokens or keys
+project/live/live_config.json
+project/live/dhan_security_ids.json
+project/config/settings.json
+
+# Live trading state
+project/live/*.db
+project/live/*.db-journal
+project/live/*.log
+project/live/*.err
+
+# Data / caches / results
+project/enriched_cache/
+project/portfolio_charts/
+logs/
+
+# OS
+Thumbs.db
+.DS_Store

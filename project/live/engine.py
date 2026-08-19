@@ -22,12 +22,15 @@ exactly like the backtest.
 from __future__ import annotations
 
 import datetime as dt
+import math
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import pandas as pd
 
 from candle_buffer import CandleBuffer
 from config import LiveConfig
@@ -69,6 +72,16 @@ class LiveEngine:
         }
         self._stop = False
         self._last_minute: dict[str, dt.datetime] = {}
+        # (strategy, symbol) pairs whose held position is ALREADY bearish at
+        # startup (the exit cross fired while the engine was offline) -> close
+        # at the first live price, then resume normal live scanning.
+        self._resume_exits: set[tuple[str, str]] = set()
+        # (strategy, symbol) pairs flat at startup whose breakout ALREADY fired
+        # on the last closed bar while offline -> open at the first live price.
+        self._resume_buys: set[tuple[str, str]] = set()
+        # last saved processing cursor per (strategy, symbol) -> only write to
+        # the checkpoints table when it actually advances.
+        self._saved_cp: dict[tuple[str, str], str] = {}
 
     # ------------------------------------------------------------------
     @property
@@ -109,9 +122,15 @@ class LiveEngine:
             row["strategy"] = strat
             broker.positions[row["symbol"]] = row
             broker.cash -= row["qty"] * row["entry_price"] + row["entry_charges"]
+        running = [(s, sym, row) for s, b in self.brokers.items()
+                   for sym, row in b.positions.items()]
+        for s, sym, row in running:
+            print(f"[running][{s}] {sym}: qty={row['qty']} "
+                  f"entry={row['entry_price']} {row['entry_dt']} "
+                  f"last={row['last_price']}")
         print(f"[setup] {len(self.security_ids)} symbols x "
               f"{len(self.strategy_names)} strategies ready, restored "
-              f"{sum(len(b.positions) for b in self.brokers.values())} positions.")
+              f"{len(running)} running position(s) from DB.")
 
     # ------------------------------------------------------------------
     def seed_history(self) -> None:
@@ -128,16 +147,102 @@ class LiveEngine:
         print("[seed] done.")
 
     def warmup_signals(self) -> None:
+        """Replay history to initialise the per-symbol state machines, then
+        reconcile any trade actions that fired while the engine was offline.
+
+        The engine persists a `checkpoints` cursor (last fast-TF candle the
+        signal machine consumed) after every poll, so a restart resumes from
+        exactly that bar.
+
+          HELD symbols (position in DB, any age):
+            resume from the saved cursor, then REPLAY every fast-TF bar that
+            closed while offline through the signal machine (in_position=True)
+            to catch exits that already fired (e.g. a cross + whipsaw that the
+            end-state check alone would miss). Flagged for a `resume` exit at
+            the first live price if a due exit is found OR the current DEMA
+            state is already bearish.
+
+          FLAT symbols:
+            full replay reconstructs pending_high (the buy arm level). If the
+            breakout already fired on the last closed bar while offline, the
+            BUY is flagged as a due entry (`resume` buy at first live price).
+        """
+        cps = self.state.load_checkpoints()
+        # Resume reconciliation only makes sense when the engine has PRIOR
+        # activity (it ran before and was offline for a while). A fresh,
+        # first-ever start must begin cleanly: warmup only arms the machines.
+        n_pos = len(self.state.load_positions())
+        n_trd = self.state.conn.execute(
+            "SELECT COUNT(*) n FROM trades").fetchone()["n"]
+        prior_activity = bool(cps) or n_pos > 0 or n_trd > 0
         for sc in self.cfg.strategies:
             pipe = self.pipelines[sc.name]
+            broker = self.brokers[sc.name]
             for sym in self.security_ids:
                 closed = pipe.closed_slice(self.buffers[sym].df)
                 fast_df = pipe.compute(closed)
-                self.signal_engines[sc.name][sym].warmup(fast_df)
+                if fast_df is None or fast_df.empty:
+                    continue
+                eng = self.signal_engines[sc.name][sym]
+                fast = fast_df[pipe.fast_col]
+                slow = fast_df[pipe.slow_col]
+                high = fast_df["high"]
+                dts = pd.to_datetime(fast_df["datetime"])
+                last_bar = fast_df.iloc[-1]
+
+                if broker.holding(sym):
+                    # resume from the saved cursor; replay bars after it
+                    cp = cps.get((sc.name, sym), {}).get("last_fast_dt")
+                    cp_ts = pd.Timestamp(cp) if cp else dts.iloc[0]
+                    start = max(eng.min_bars - 1,
+                                int(dts.searchsorted(cp_ts, side="right")))
+                    due = False
+                    for i in range(start, len(fast_df)):
+                        act = eng._step(i, fast, slow, high, dts, in_position=True)
+                        if act is not None and act["type"] == "SELL":
+                            due = True
+                            break
+                    f, s = float(last_bar[pipe.fast_col]), float(last_bar[pipe.slow_col])
+                    if not (math.isnan(f) or math.isnan(s)) and f <= s:
+                        due = True
+                    eng._last_fast_dt = dts.iloc[-1]
+                    if due:
+                        self._resume_exits.add((sc.name, sym))
+                else:
+                    # flat: full replay reconstructs the buy-arm level; if the
+                    # breakout already fired on the final closed bar while the
+                    # engine was offline AND it had prior activity, the entry
+                    # is due at resume. A first-ever start begins cleanly.
+                    act = eng.warmup(fast_df)
+                    if prior_activity and act is not None and act["type"] == "BUY":
+                        self._resume_buys.add((sc.name, sym))
+
+                # advance the persisted cursor to the last replayed bar
+                self._maybe_save_cp(sc.name, sym, eng._last_fast_dt)
         pend = {n: sum(1 for s in self.signal_engines[n].values()
                        if getattr(s, "pending_high", None) is not None)
                 for n in self.strategy_names}
         print(f"[warmup] signal state machines initialised ({pend} pending).")
+        if self._resume_exits:
+            print(f"[resume] {len(self._resume_exits)} held position(s) due exit "
+                  f"(cross fired while offline) -> close at first live price: "
+                  f"{sorted(self._resume_exits)}")
+        if self._resume_buys:
+            print(f"[resume] {len(self._resume_buys)} flat symbol(s) due entry "
+                  f"(breakout fired while offline) -> open at first live price: "
+                  f"{sorted(self._resume_buys)}")
+
+    def _maybe_save_cp(self, strat: str, sym: str, last_fast_dt,
+                       last_1m_dt=None) -> None:
+        if last_fast_dt is None and last_1m_dt is None:
+            return  # nothing new to persist
+        key = (strat, sym)
+        cur = self._saved_cp.get(key)
+        fv = str(last_fast_dt) if last_fast_dt is not None else None
+        mv = str(last_1m_dt) if last_1m_dt is not None else None
+        if cur != (fv, mv):
+            self.state.save_checkpoint(strat, sym, fv, mv)
+            self._saved_cp[key] = (fv, mv)
 
     # ------------------------------------------------------------------
     def _close_stops(self, strat: str, closed_by_stop: list[dict]) -> None:
@@ -163,6 +268,7 @@ class LiveEngine:
             return
         self.buffers[sym].merge(df)
         forming = float(df.iloc[-1]["close"])
+        last_1m_dt = str(pd.to_datetime(df.iloc[-1]["datetime"]))
         # one consistent price for fills and SL/TP: the batch-quote live price
         # when available (minute mode), else the forming-candle close
         px = live_price if live_price is not None else forming
@@ -202,8 +308,37 @@ class LiveEngine:
                             self.state.delete_position(sym, strat)
                             self.status["trades_today"][strat] += 1
 
+            # RESUME reconciliation (one-shot, restart only): trade actions that
+            # fired while the engine was offline are executed at the first live
+            # price, then normal live scanning continues untouched.
+            if (strat, sym) in self._resume_buys:
+                self._resume_buys.discard((strat, sym))
+                if not broker.holding(sym):
+                    pos = broker.buy(sym, px)
+                    if pos:
+                        print(f"[RESUME][{strat}] BUY  {sym} @ {pos['entry_price']} "
+                              f"x {pos['qty']} (entry due while offline)")
+                        self.state.upsert_position(pos)
+                        self.status["signals_today"][strat] += 1
+            if (strat, sym) in self._resume_exits:
+                self._resume_exits.discard((strat, sym))
+                if broker.holding(sym) and fast_df is not None and not fast_df.empty:
+                    last = fast_df.iloc[-1]
+                    f, s = float(last[pipe.fast_col]), float(last[pipe.slow_col])
+                    if not (math.isnan(f) or math.isnan(s)) and f <= s:
+                        t = broker.sell(sym, px, reason="resume")
+                        if t:
+                            print(f"[RESUME][{strat}] SELL {sym} @ {t['exit_price']} "
+                                  f"pnl={t['pnl']:.2f} (exit due while offline)")
+                            self.state.save_trade(t)
+                            self.state.delete_position(sym, strat)
+                            self.status["trades_today"][strat] += 1
+
             # mark-to-market + SL/TP on every poll using the live price
             self._close_stops(strat, broker.mark_to_market({sym: px}))
+
+            # persist the processing cursor so a restart resumes from here
+            self._maybe_save_cp(strat, sym, engine._last_fast_dt, last_1m_dt)
 
         self.status["last_poll"][sym] = (
             f"{dt.datetime.now().strftime('%H:%M:%S')} close={forming:.2f} "

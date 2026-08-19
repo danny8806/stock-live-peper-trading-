@@ -84,18 +84,27 @@ class DEMAATRSignals:
         return None
 
     # ------------------------------------------------------------------
-    def warmup(self, fast_df: pd.DataFrame) -> None:
-        """Replay all historical fast-TF bars, updating state only (no actions)."""
+    def warmup(self, fast_df: pd.DataFrame) -> dict | None:
+        """Replay all historical fast-TF bars, updating state only (no actions).
+
+        Returns the last action that would have fired on the FINAL bar, or None
+        — lets the engine reconcile a breakout that already fired while the
+        engine was offline (a `resume` buy due at the first live price).
+        """
         if fast_df is None or len(fast_df) < self.min_bars:
-            return
+            return None
         fast = fast_df[self.fast_col]
         slow = fast_df[self.slow_col]
         high = fast_df["high"]
         dts = pd.to_datetime(fast_df["datetime"])
+        last_action: dict | None = None
         for i in range(self.min_bars - 1, len(fast_df)):
-            self._step(i, fast, slow, high, dts, in_position=False)
+            act = self._step(i, fast, slow, high, dts, in_position=False)
+            if act is not None:
+                last_action = act
         self._last_fast_dt = dts.iloc[-1]
         self.warmed_up = True
+        return last_action
 
     def on_new_bars(self, fast_df: pd.DataFrame, in_position: bool) -> list[dict]:
         """Process fast-TF bars that closed after the last processed bar.

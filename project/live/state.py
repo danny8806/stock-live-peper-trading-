@@ -56,6 +56,14 @@ class StateStore:
                 ts TEXT, equity REAL, cash REAL, positions INTEGER,
                 unrealized REAL DEFAULT 0, invested REAL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS checkpoints (
+                strategy TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                last_fast_dt TEXT,
+                last_1m_dt TEXT,
+                ts TEXT,
+                PRIMARY KEY (strategy, symbol)
+            );
         """)
         self._migrate()
         self.conn.commit()
@@ -164,6 +172,41 @@ class StateStore:
             (strategy, round(equity, 2), round(cash, 2), n_positions,
              round(unrealized, 2), round(invested, 2)))
         self.conn.commit()
+
+    # ------------------------------------------------------------------
+    # Signal-processing checkpoint (restart-resume cursor)
+    # ------------------------------------------------------------------
+    def save_checkpoint(self, strategy: str, symbol: str,
+                        last_fast_dt: str | None = None,
+                        last_1m_dt: str | None = None) -> None:
+        """Persist the processing cursors (last consumed fast-TF candle and
+        last merged 1-min candle) per (strategy, symbol), so a restart resumes
+        from exactly that bar. A None value preserves the existing cursor —
+        a valid cursor is never overwritten with nothing."""
+        fast = str(last_fast_dt) if last_fast_dt is not None else None
+        one = str(last_1m_dt) if last_1m_dt is not None else None
+        if fast is None and one is None:
+            return
+        row = self.conn.execute(
+            "SELECT last_fast_dt, last_1m_dt FROM checkpoints "
+            "WHERE strategy=? AND symbol=?", (strategy, symbol)).fetchone()
+        if fast is None and row is not None and row["last_fast_dt"] is not None:
+            fast = row["last_fast_dt"]
+        if one is None and row is not None and row["last_1m_dt"] is not None:
+            one = row["last_1m_dt"]
+        self.conn.execute(
+            "INSERT INTO checkpoints (strategy, symbol, last_fast_dt, last_1m_dt, ts) "
+            "VALUES (?,?,?,?, datetime('now','localtime')) "
+            "ON CONFLICT(strategy, symbol) DO UPDATE SET "
+            "last_fast_dt=excluded.last_fast_dt, last_1m_dt=excluded.last_1m_dt, "
+            "ts=excluded.ts",
+            (strategy, symbol, fast, one))
+        self.conn.commit()
+
+    def load_checkpoints(self) -> dict[tuple[str, str], dict]:
+        """All persisted processing cursors, keyed (strategy, symbol)."""
+        rows = self.conn.execute("SELECT * FROM checkpoints").fetchall()
+        return {(r["strategy"], r["symbol"]): dict(r) for r in rows}
 
     # ------------------------------------------------------------------
     def summary(self, strategy: str | None = None) -> dict:

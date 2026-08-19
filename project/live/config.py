@@ -108,11 +108,15 @@ class LiveConfig:
         paper = self.raw.get("paper", {})
         # fetch_mode: "tick"  = old per-symbol intraday fetch every poll
         #              "minute" = 200-stock optimized: batch OHLC quote every
-        #                         cycle + intraday fetch once per minute,
-        #                         throttled to max_intraday_per_cycle symbols/cycle
+        #                         cycle (chunked to quote_chunk_size IDs) +
+        #                         intraday fetch once per minute, throttled to
+        #                         max_intraday_per_cycle symbols/cycle and
+        #                         fetched concurrently (intraday_parallel workers)
         self.fetch_mode = paper.get("fetch_mode", "tick")
         self.cycle_seconds = paper.get("cycle_seconds", 1.0)
         self.max_intraday_per_cycle = paper.get("max_intraday_per_cycle", 20)
+        self.intraday_parallel = paper.get("intraday_parallel", 8)
+        self.quote_chunk_size = paper.get("quote_chunk_size", 100)
         self.poll_seconds_per_stock = paper.get("poll_seconds_per_stock", 1.0)
 
         app = self.raw.get("app", {})

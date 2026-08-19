@@ -155,6 +155,50 @@ class StateStore:
             [trade.get(c) for c in TRADE_COLS])
         self.conn.commit()
 
+    def close_position_trade(self, trade: dict, strategy: str = "") -> bool:
+        """Atomically persist a closing trade AND remove its open position.
+
+        A single SQLite transaction (BEGIN IMMEDIATE) replaces the old
+        save_trade-then-delete_position two-step, which left a crash window
+        between the two commits: on restart the stale position was re-sold,
+        recording a duplicate exit. Now either both write or neither does.
+
+        Idempotency: if a trade for this exact position (same strategy, symbol,
+        entry_dt, entry_price and qty) already exists — e.g. a leftover from the
+        old crash window — the stale position row is still removed but no second
+        trade is inserted. Returns True when a new trade was recorded.
+        """
+        trade = dict(trade)
+        strat = strategy or trade.get("strategy", "")
+        trade.setdefault("strategy", strat)
+        inserted = False
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            entry_dt = trade.get("entry_dt")
+            if entry_dt:
+                exists = self.conn.execute(
+                    "SELECT id FROM trades WHERE strategy=? AND symbol=? AND "
+                    "entry_dt=? AND entry_price=? AND qty=?",
+                    (strat, trade["symbol"], entry_dt,
+                     trade.get("entry_price"), trade.get("qty"))).fetchone()
+            else:
+                exists = None
+            if exists is None:
+                self.conn.execute(
+                    "INSERT INTO trades (strategy, symbol, qty, entry_price, "
+                    "exit_price, entry_dt, exit_dt, pnl, charges, reason) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    [trade.get(c) for c in TRADE_COLS])
+                inserted = True
+            self.conn.execute(
+                "DELETE FROM positions WHERE symbol=? AND strategy=?",
+                (trade["symbol"], strat))
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        return inserted
+
     def log_signal(self, symbol: str, sig_type: str, detail: dict | None = None,
                    strategy: str = "") -> None:
         self.conn.execute(

@@ -14,7 +14,8 @@ signal engine + paper broker.
 Two fetch modes (config `paper.fetch_mode`):
   "tick"   — sequential per-symbol intraday fetch (~1s cadence)
   "minute" — 200-stock optimized: 1 batch OHLC quote per cycle + intraday
-             fetch throttled to max_intraday_per_cycle symbols/cycle
+             fetch throttled to max_intraday_per_cycle symbols/cycle and
+             fetched concurrently (intraday_parallel workers)
 
 Signals NEVER fire on the forming candle — only on fully-closed fast-TF bars,
 exactly like the backtest.
@@ -25,6 +26,7 @@ import datetime as dt
 import math
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -191,9 +193,14 @@ class LiveEngine:
                 last_bar = fast_df.iloc[-1]
 
                 if broker.holding(sym):
-                    # resume from the saved cursor; replay bars after it
+                    # resume from the saved cursor; replay bars after it.
+                    # A corrupt checkpoint must never crash warmup: fall back
+                    # to a full replay when the stored cursor cannot be parsed.
                     cp = cps.get((sc.name, sym), {}).get("last_fast_dt")
-                    cp_ts = pd.Timestamp(cp) if cp else dts.iloc[0]
+                    try:
+                        cp_ts = pd.Timestamp(cp) if cp else dts.iloc[0]
+                    except (ValueError, TypeError):
+                        cp_ts = dts.iloc[0]
                     start = max(eng.min_bars - 1,
                                 int(dts.searchsorted(cp_ts, side="right")))
                     due = False
@@ -250,21 +257,60 @@ class LiveEngine:
         for t in closed_by_stop:
             print(f"[LIVE][{strat}] {t['exit_dt']} SELL {t['symbol']} @ {t['exit_price']} "
                   f"pnl={t['pnl']:.2f} ({t['reason']})")
-            self.state.save_trade(t)
-            self.state.delete_position(t["symbol"], strat)
-            self.status["trades_today"][strat] += 1
+            if self.state.close_position_trade(t, strat):
+                self.status["trades_today"][strat] += 1
 
     def _poll_symbol(self, sym: str, live_price: float | None = None) -> None:
         """Full live pass for one symbol across ALL strategies: intraday fetch
         -> (per strategy) pipeline -> signals -> execute -> mark-to-market."""
+        self._process_fetched(sym, self._fetch_symbol(sym), live_price)
+
+    def _fetch_symbol(self, sym: str) -> pd.DataFrame:
+        """I/O only: 1-min intraday fetch for one symbol (thread-safe; never
+        raises). Returns an empty frame on failure."""
         sid = self.security_ids[sym]
         today = dt.date.today()
-        df = self.dhan.fetch_intraday_1m(sid, today, today)
+        try:
+            df = self.dhan.fetch_intraday_1m(sid, today, today)
+        except Exception as e:
+            self.status["last_poll"][sym] = f"{dt.datetime.now().strftime('%H:%M:%S')} err: {e}"
+            return pd.DataFrame()
         if df.empty:
             err = f"{dt.datetime.now().strftime('%H:%M:%S')} empty"
             if self.dhan.last_error:
                 err += f" (dhan: {self.dhan.last_error})"
             self.status["last_poll"][sym] = err
+        return df
+
+    def _fetch_batch(self, symbols: list[str]) -> dict[str, pd.DataFrame]:
+        """Concurrent intraday fetches (I/O-bound REST calls), bounded by
+        cfg.intraday_parallel workers. Returns {sym: df}."""
+        out: dict[str, pd.DataFrame] = {}
+        workers = max(1, min(self.cfg.intraday_parallel, len(symbols)))
+        if workers <= 1:
+            for s in symbols:
+                out[s] = self._fetch_symbol(s)
+            return out
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(self._fetch_symbol, s): s for s in symbols}
+            for fut in as_completed(futs):
+                s = futs[fut]
+                try:
+                    out[s] = fut.result()
+                except Exception as e:  # never let one symbol kill the batch
+                    self.status["last_poll"][s] = (
+                        f"{dt.datetime.now().strftime('%H:%M:%S')} err: {e}")
+                    out[s] = pd.DataFrame()
+        return out
+
+    def _any_holding(self, sym: str) -> bool:
+        return any(self.brokers[n].holding(sym) for n in self.strategy_names)
+
+    def _process_fetched(self, sym: str, df: pd.DataFrame,
+                         live_price: float | None = None) -> None:
+        """CPU + state: merge fetched bars, run every strategy's pipeline ->
+        signals -> execute -> mark-to-market -> checkpoint."""
+        if df is None or df.empty:
             return
         self.buffers[sym].merge(df)
         forming = float(df.iloc[-1]["close"])
@@ -283,30 +329,37 @@ class LiveEngine:
             closed = pipe.closed_slice(self.buffers[sym].df)
             fast_df = pipe.compute(closed)
             if fast_df is not None and not fast_df.empty:
+                # Per-bar processing: position state is tracked bar by bar so a
+                # BUY and a subsequent SELL inside the same fetched batch are
+                # both executed — the machine is never wedged by a stale
+                # single-batch `in_position` (a bear cross right after an entry
+                # must exit, not wait for the next poll).
                 in_pos = broker.holding(sym)
-                actions = engine.on_new_bars(fast_df, in_pos)
-                for act in actions:
-                    if act["type"] == "BUY":
-                        self.state.log_signal(sym, "BUY", act, strategy=strat)
-                        self.status["signals_today"][strat] += 1
-                        pos = broker.buy(sym, px)
-                        if pos:
-                            print(f"[LIVE][{strat}] {act['datetime']} BUY  {sym} "
-                                  f"@ {pos['entry_price']} x {pos['qty']} "
-                                  f"(breakout>{act['breakout_above']:.2f})")
-                            self.state.upsert_position(pos)
-                        else:
-                            print(f"[LIVE][{strat}] {act['datetime']} BUY  {sym} "
-                                  f"REJECTED (no cash / slot full)")
-                    elif act["type"] == "SELL":
-                        self.state.log_signal(sym, "SELL", act, strategy=strat)
-                        t = broker.sell(sym, px, reason=act.get("reason", "cross"))
-                        if t:
-                            print(f"[LIVE][{strat}] {act['datetime']} SELL {sym} "
-                                  f"@ {t['exit_price']} pnl={t['pnl']:.2f} ({t['reason']})")
-                            self.state.save_trade(t)
-                            self.state.delete_position(sym, strat)
-                            self.status["trades_today"][strat] += 1
+                for i in range(engine.next_bar_index(fast_df), len(fast_df)):
+                    for act in engine.on_new_bars(fast_df.iloc[: i + 1], in_pos):
+                        if act["type"] == "BUY":
+                            self.state.log_signal(sym, "BUY", act, strategy=strat)
+                            self.status["signals_today"][strat] += 1
+                            pos = broker.buy(sym, px, quote_dt=dt.datetime.now())
+                            if pos:
+                                print(f"[LIVE][{strat}] {act['datetime']} BUY  {sym} "
+                                      f"@ {pos['entry_price']} x {pos['qty']} "
+                                      f"(breakout>{act['breakout_above']:.2f})")
+                                self.state.upsert_position(pos)
+                                in_pos = True
+                            else:
+                                print(f"[LIVE][{strat}] {act['datetime']} BUY  {sym} "
+                                      f"REJECTED (no cash / slot full)")
+                        elif act["type"] == "SELL":
+                            self.state.log_signal(sym, "SELL", act, strategy=strat)
+                            t = broker.sell(sym, px, quote_dt=dt.datetime.now(),
+                                            reason=act.get("reason", "cross"))
+                            if t:
+                                print(f"[LIVE][{strat}] {act['datetime']} SELL {sym} "
+                                      f"@ {t['exit_price']} pnl={t['pnl']:.2f} ({t['reason']})")
+                                if self.state.close_position_trade(t, strat):
+                                    self.status["trades_today"][strat] += 1
+                                in_pos = False
 
             # RESUME reconciliation (one-shot, restart only): trade actions that
             # fired while the engine was offline are executed at the first live
@@ -314,7 +367,7 @@ class LiveEngine:
             if (strat, sym) in self._resume_buys:
                 self._resume_buys.discard((strat, sym))
                 if not broker.holding(sym):
-                    pos = broker.buy(sym, px)
+                    pos = broker.buy(sym, px, quote_dt=dt.datetime.now())
                     if pos:
                         print(f"[RESUME][{strat}] BUY  {sym} @ {pos['entry_price']} "
                               f"x {pos['qty']} (entry due while offline)")
@@ -326,13 +379,13 @@ class LiveEngine:
                     last = fast_df.iloc[-1]
                     f, s = float(last[pipe.fast_col]), float(last[pipe.slow_col])
                     if not (math.isnan(f) or math.isnan(s)) and f <= s:
-                        t = broker.sell(sym, px, reason="resume")
+                        t = broker.sell(sym, px, quote_dt=dt.datetime.now(),
+                                        reason="resume")
                         if t:
                             print(f"[RESUME][{strat}] SELL {sym} @ {t['exit_price']} "
                                   f"pnl={t['pnl']:.2f} (exit due while offline)")
-                            self.state.save_trade(t)
-                            self.state.delete_position(sym, strat)
-                            self.status["trades_today"][strat] += 1
+                            if self.state.close_position_trade(t, strat):
+                                self.status["trades_today"][strat] += 1
 
             # mark-to-market + SL/TP on every poll using the live price
             self._close_stops(strat, broker.mark_to_market({sym: px}))
@@ -347,6 +400,9 @@ class LiveEngine:
     # ------------------------------------------------------------------
     def _tick(self, sym: str, price: float) -> None:
         """Pure tick: SL/TP mark-to-market for one symbol across ALL strategies."""
+        cur = self.status["last_poll"].get(sym, "")
+        if "err" in cur or "empty" in cur:
+            return  # keep a visible fetch failure; don't mask it with a tick
         for sc in self.cfg.strategies:
             strat = sc.name
             self._close_stops(strat, self.brokers[strat].mark_to_market({sym: price}))
@@ -387,34 +443,42 @@ class LiveEngine:
             self._log_cycle()
 
     def _run_optimized(self, iterations: int | None) -> None:
-        """200-stock mode: one batch quote per cycle + intraday fetch spread
-        across cycles (max_intraday_per_cycle per cycle)."""
+        """200-stock mode: one batch quote per cycle (chunked to the API's
+        per-request cap) + intraday fetch spread across cycles
+        (max_intraday_per_cycle per cycle, fetched concurrently)."""
         self._last_minute = {s: None for s in self.security_ids}
         all_ids = [int(v) for v in self.security_ids.values()]
+        chunk_size = max(1, self.cfg.quote_chunk_size)
         cycle = 0
         while not self._stop:
             cycle += 1
             self.status["cycle"] = cycle
             t0 = time.perf_counter()
 
-            # 1) one batch OHLC quote request for ALL symbols
+            # 1) one batch OHLC quote request per chunk of symbols
             quotes: dict = {}
-            try:
-                quotes = self.dhan.fetch_ohlc_quotes(all_ids)
-            except Exception as e:
-                print(f"[ERROR] batch quotes: {e}")
+            for i in range(0, len(all_ids), chunk_size):
+                chunk = all_ids[i:i + chunk_size]
+                try:
+                    quotes.update(self.dhan.fetch_ohlc_quotes(chunk))
+                except Exception as e:
+                    print(f"[ERROR] batch quotes (chunk {i//chunk_size}): {e}")
 
             now_min = dt.datetime.now().replace(second=0, microsecond=0)
 
             # 2) symbols whose minute changed since their last intraday fetch
-            #    (throttled so 200 symbols are refreshed within ~a minute)
+            #    (throttled so 200 symbols are refreshed within ~a minute);
+            #    symbols with open positions get priority
             todo = [s for s in self.security_ids if self._last_minute[s] != now_min]
-            todo = todo[: self.cfg.max_intraday_per_cycle]
+            held = [s for s in todo if self._any_holding(s)]
+            todo = (held + [s for s in todo if s not in held])[: self.cfg.max_intraday_per_cycle]
+            frames = self._fetch_batch(todo)  # concurrent intraday fetches
             for s in todo:
                 if self._stop:
                     break
                 try:
-                    self._poll_symbol(s, live_price=self._quote_price(quotes, str(self.security_ids[s])))
+                    self._process_fetched(s, frames.get(s),
+                                          live_price=self._quote_price(quotes, str(self.security_ids[s])))
                     self._last_minute[s] = now_min
                 except Exception as e:  # keep the loop alive
                     print(f"[ERROR] {s}: {e}")
@@ -474,7 +538,7 @@ class LiveEngine:
         if self.cfg.fetch_mode == "minute":
             print(f"[run] batch quote every {self.cfg.cycle_seconds:.1f}s + intraday "
                   f"fetch throttled to {self.cfg.max_intraday_per_cycle} symbols/cycle "
-                  f"(200-stock mode)")
+                  f"({self.cfg.intraday_parallel} parallel, 200-stock mode)")
         else:
             print(f"[run] sequential poll: {self.cfg.poll_seconds_per_stock:.1f}s/symbol, "
                   f"{len(self.security_ids)} symbols -> "

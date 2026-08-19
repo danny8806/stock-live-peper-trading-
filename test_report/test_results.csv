@@ -1,0 +1,17 @@
+test,status,detail
+T1 Candle integrity (dup/order/revision/forming/time/missing),PASS,dedup+sort+keep-last; forming bar gated at next-minute boundary
+T2 No look-ahead: historical DEMA values invariant to future bars,PASS,3 early buckets bit-identical after extension
+T3 Signal machine (arm/exact-touch/strict-break/sell/cursor),PASS,pending kept after flat bear cross; strict >; no dup BUY; SELL on held cross
+T4 Broker financials (fill/qty/cash/charges/100-trade/cash-exhaust/limit/reject),PASS,fills+slippage+charges independently recomputed; equity conservation over 100 trades
+T5 SL/TP (exact/gap/simultaneous-one-exit),PASS,"SL<=, TP>=, gap fills at current px, no double exit"
+"T6 Restart/resume (exit once, buy once, restart#2 clean, cp merge-safe)",PASS,1 resume trade; HELD/BREAK running; no re-triggers on restart#2
+T6.4 close_position_trade atomicity + duplicate-SELL regression (was BUG-A),PASS,"rollback atomic; legacy [trade+position] -> 1 trade, 0 positions"
+T6.5 Corrupted checkpoint value handled gracefully,PASS,engine survived garbage checkpoint
+"T7 Multi-strategy isolation (same symbol, separate capital/positions/cash)",PASS,KAYNES held by both; A sell leaves B + A cash independent
+T8 per-bar in-position: BUY + bear-cross in one batch (was BUG-B),PASS,entered @97.10 breakout then exited same batch (fast 98.80<slow 114.78)
+T9.1 Determinism (same feed twice -> identical trades/cursor),PASS,"trade ('X', 713, 140.07, 79.96, 'cross') identical"
+T9.2 Engine-style per-bar driving == sequential reference (was BUG-B),PASS,"[BUY, SELL] driven per-bar identically"
+T9.3 Intraday fetch parallelism (8 workers < serial time),PASS,8 slow fetches in 0.05s
+T9.4 Quote chunking (250 ids -> <=100/chunk),PASS,"chunks=[100, 100, 50]"
+T10 Charges engine (STT/TC/SEBI/stamp/GST recomputed sum + round trip),PASS,buy=25.82 sell=34.86
+T11 Secrets: token absent from engine status,PASS,status dict is token-free

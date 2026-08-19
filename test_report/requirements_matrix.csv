@@ -1,0 +1,17 @@
+requirement,section,status
+R1 Candle integrity (dup/out-of-order/late/revision/forming/missing),T1,PASS
+R2 Look-ahead bias / no repainting,T2,PASS
+R3 Signal state machine + exact-touch breakout semantics,T3,PASS
+R4 Broker accounting (cash/charges/slippage/qty/limits/100-trade),T4,PASS
+R5 SL/TP exact + gap + simultaneous one-exit,T5,PASS
+R6 Restart/resume + checkpoint persistence + monotonicity,T6,PASS
+R7 Atomicity: crash between trade-save and position-delete,T6.4,PASS (regression)
+R8 Corrupted state handling (checkpoint validation),T6.5,PASS (regression)
+"R9 Multi-strategy isolation (same symbol, capital, cash)",T7,PASS
+R10 Batch correctness: entry+exit in one batch,T8,PASS (regression)
+R11 Deterministic replay (A vs B identical),T9.1,PASS
+R12 Engine per-bar driving == sequential reference,T9.2,PASS (regression)
+R13 Intraday fetch parallelism,T9.3,PASS
+R14 Quote chunking (200-stock mode),T9.4,PASS
+R15 Charges engine recomputation + round trip,T10,PASS
+R16 Secret hygiene (token absent from status),T11,PASS

@@ -106,10 +106,30 @@ class DEMAATRSignals:
         self.warmed_up = True
         return last_action
 
+    def next_bar_index(self, fast_df: pd.DataFrame) -> int:
+        """Index of the first bar this machine still needs to process (the bar
+        after the persisted cursor). Shared by `on_new_bars` and callers that
+        drive the machine bar-by-bar (e.g. the live engine tracking position
+        state across the batch)."""
+        if fast_df is None or fast_df.empty:
+            return 0
+        dts = pd.to_datetime(fast_df["datetime"])
+        start = self.min_bars - 1
+        if self._last_fast_dt is not None:
+            start = max(start, int(dts.searchsorted(self._last_fast_dt, side="right")))
+        elif not self.warmed_up:
+            start = len(fast_df) - 1
+        return start
+
     def on_new_bars(self, fast_df: pd.DataFrame, in_position: bool) -> list[dict]:
         """Process fast-TF bars that closed after the last processed bar.
 
         Returns a list of action dicts ({type: BUY|SELL, ...}) in order.
+
+        `in_position` is the position state at the START of the batch. Callers
+        that need per-bar state (a BUY and a later SELL inside the same batch)
+        must call `on_new_bars` once per new bar while tracking the flag
+        themselves — see `engine.LiveEngine._process_fetched`.
         """
         actions: list[dict] = []
         if fast_df is None or fast_df.empty:
@@ -119,13 +139,7 @@ class DEMAATRSignals:
         high = fast_df["high"]
         dts = pd.to_datetime(fast_df["datetime"])
 
-        start = self.min_bars - 1
-        if self._last_fast_dt is not None:
-            start = max(start, int(dts.searchsorted(self._last_fast_dt, side="right")))
-        elif not self.warmed_up:
-            # no warmup performed: process only the final bar to stay current
-            start = len(fast_df) - 1
-
+        start = self.next_bar_index(fast_df)
         for i in range(start, len(fast_df)):
             action = self._step(i, fast, slow, high, dts, in_position)
             if action is not None:

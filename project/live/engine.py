@@ -255,6 +255,7 @@ class LiveEngine:
     def _close_stops(self, strat: str, closed_by_stop: list[dict]) -> None:
         """Persist trades closed by SL/TP for one strategy and clean up."""
         for t in closed_by_stop:
+            t.setdefault("exit_dt", dt.datetime.now())
             print(f"[LIVE][{strat}] {t['exit_dt']} SELL {t['symbol']} @ {t['exit_price']} "
                   f"pnl={t['pnl']:.2f} ({t['reason']})")
             if self.state.close_position_trade(t, strat):

@@ -53,16 +53,21 @@ class DhanClient:
         """Live quotes for a batch: {symbol: {"last_price": float, "ohlc": {...}}}"""
         if not security_ids:
             return {}
-        r = self.client.ohlc_data({self.exchange_segment: security_ids})
+        # Dhan's ohlc_data requires int IDs; the security-ID cache stores strings.
+        ids = [int(s) for s in security_ids]
+        r = self.client.ohlc_data({self.exchange_segment: ids})
         out = {}
-        if r.get("status") == "success":
-            data = r.get("data", {})
-            # Dhan nests the payload one level deeper: {"data": {"data": {...}}}
-            if isinstance(data, dict) and "data" in data:
-                data = data["data"]
-            seg = data.get(self.exchange_segment, {}) if isinstance(data, dict) else {}
-            for sid, payload in seg.items():
-                out[str(sid)] = payload
+        self.last_error = None
+        if r.get("status") != "success":
+            self.last_error = r.get("remarks")
+            return {}
+        data = r.get("data", {})
+        # Dhan nests the payload one level deeper: {"data": {"data": {...}}}
+        if isinstance(data, dict) and "data" in data:
+            data = data["data"]
+        seg = data.get(self.exchange_segment, {}) if isinstance(data, dict) else {}
+        for sid, payload in seg.items():
+            out[str(sid)] = payload
         return out
 
     def fetch_intraday_1m(self, security_id: str | int,
